@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>旧手机监控 · 网页调试</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:#10161b;color:#e6edf3;
+       font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:10px;padding:12px 18px;background:#17222b;border-bottom:1px solid #243441}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  .dot{width:9px;height:9px;border-radius:50%;background:#7a8b99;transition:.2s}
+  .dot.on{background:#2ecc71;box-shadow:0 0 8px #2ecc71}
+  .dot.err{background:#e74c3c}
+  #status{margin-left:auto;font-size:13px;color:#9fb0bf}
+  main{flex:1;display:flex;align-items:center;justify-content:center;padding:16px}
+  .stage{position:relative;width:100%;max-width:1100px}
+  video{width:100%;max-height:72vh;background:#000;border-radius:10px;display:block;object-fit:contain}
+  .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+           flex-direction:column;gap:12px;background:rgba(10,14,18,.75);border-radius:10px;
+           text-align:center;padding:24px;color:#9fb0bf;font-size:14px;line-height:1.7}
+  .overlay.hide{display:none}
+  footer{display:flex;gap:10px;justify-content:center;align-items:center;padding:14px;
+         background:#17222b;border-top:1px solid #243441;flex-wrap:wrap}
+  button{padding:9px 18px;border-radius:8px;border:1px solid #2f4656;background:#1d2b36;
+         color:#dce7ef;font-size:14px;cursor:pointer}
+  button:hover{background:#253846}
+  button.primary{background:#2e7d6f;border-color:#2e7d6f;color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .tip{font-size:12px;color:#6d7f8d}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>旧手机监控 · 网页调试</h1>
+  <span id="status">未连接</span>
+</header>
+<main>
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <div class="overlay" id="overlay">
+      <div id="overlayText">正在连接采集端…</div>
+      <div class="tip" id="overlayTip"></div>
+    </div>
+  </div>
+</main>
+<footer>
+  <button class="primary" id="reconnect">重新连接</button>
+  <button id="mic" disabled>开启对讲</button>
+  <button id="fs">全屏</button>
+  <span class="tip">本页面仅供调试，正式观看请使用 APP</span>
+</footer>
+<script>
+(function () {
+  const video = document.getElementById('video');
+  const dot = document.getElementById('dot');
+  const statusEl = document.getElementById('status');
+  const overlay = document.getElementById('overlay');
+  const overlayText = document.getElementById('overlayText');
+  const overlayTip = document.getElementById('overlayTip');
+  const micBtn = document.getElementById('mic');
+  const fsBtn = document.getElementById('fs');
+
+  const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+  let pc = null, ws = null, retryTimer = null, micStream = null, closedByUser = false;
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    dot.className = 'dot' + (cls ? ' ' + cls : '');
+  }
+  function showOverlay(text, tip) {
+    overlayText.textContent = text;
+    overlayTip.textContent = tip || '';
+    overlay.classList.remove('hide');
+  }
+  function hideOverlay() { overlay.classList.add('hide'); }
+  function send(msg) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  }
+
+  function cleanup() {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+    video.srcObject = null;
+    micBtn.disabled = true;
+    micBtn.textContent = '开启对讲';
+  }
+
+  async function start() {
+    cleanup();
+    closedByUser = false;
+    setStatus('正在连接…', '');
+    showOverlay('正在连接采集端…', WS_URL);
+    micBtn.disabled = true;
+
+    pc = new RTCPeerConnection(RTC_CONFIG);
+    const pendingIce = [];
+
+    pc.onicecandidate = e => {
+      if (e.candidate) send({ type: 'ice', candidate: e.candidate.toJSON() });
+    };
+    pc.ontrack = e => {
+      if (e.streams && e.streams[0]) {
+        video.srcObject = e.streams[0];
+        video.play().catch(() => {});
+        hideOverlay();
+        setStatus('已连接 · 实时画面', 'on');
+        micBtn.disabled = false;
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (!pc) return;
+      if (pc.connectionState === 'connected') {
+        hideOverlay();
+        setStatus('已连接 · 实时画面', 'on');
+      } else if (pc.connectionState === 'failed') {
+        setStatus('连接失败', 'err');
+        showOverlay('连接失败', '请确认手机端采集页停留在前台，且在同一 WiFi');
+      } else if (pc.connectionState === 'disconnected') {
+        setStatus('连接中断，尝试恢复…', 'err');
+      }
+    };
+
+    ws = new WebSocket(WS_URL);
+    ws.onopen = async () => {
+      setStatus('信令已连接，正在协商视频…', 'on');
+      try {
+        const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
+        await pc.setLocalDescription(offer);
+        send({ type: 'offer', sdp: pc.localDescription.sdp });
+      } catch (err) {
+        setStatus('协商失败', 'err');
+        showOverlay('协商失败', String(err));
+      }
+    };
+    ws.onmessage = async ev => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'answer') {
+        await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+        for (const c of pendingIce.splice(0)) {
+          try { await pc.addIceCandidate(c); } catch (e) {}
+        }
+      } else if (msg.type === 'ice') {
+        const cand = msg.candidate;
+        if (pc.remoteDescription) {
+          try { await pc.addIceCandidate(cand); } catch (e) {}
+        } else {
+          pendingIce.push(cand);
+        }
+      }
+    };
+    ws.onerror = () => setStatus('信令连接异常', 'err');
+    ws.onclose = () => {
+      if (closedByUser) return;
+      setStatus('信令断开，3 秒后重连…', 'err');
+      showOverlay('信令断开', '正在自动重连…');
+      retryTimer = setTimeout(start, 3000);
+    };
+  }
+
+  document.getElementById('reconnect').onclick = () => start();
+
+  micBtn.onclick = async () => {
+    if (!pc) return;
+    try {
+      if (!micStream) {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true }
+        });
+        micStream.getAudioTracks().forEach(t => pc.addTrack(t, micStream));
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type: 'offer', sdp: pc.localDescription.sdp });
+        micBtn.textContent = '关闭对讲';
+        setStatus('对讲已开启', 'on');
+      } else {
+        micStream.getTracks().forEach(t => { t.stop(); pc.removeTrack(t); });
+        micStream = null;
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        send({ type: 'offer', sdp: pc.localDescription.sdp });
+        micBtn.textContent = '开启对讲';
+        setStatus('对讲已关闭', 'on');
+      }
+    } catch (err) {
+      setStatus('麦克风不可用：' + err.name, 'err');
+    }
+  };
+
+  fsBtn.onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else video.requestFullscreen && video.requestFullscreen();
+  };
+
+  start();
+})();
+</script>
+</body>
+</html>
