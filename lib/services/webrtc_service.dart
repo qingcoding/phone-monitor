@@ -17,6 +17,16 @@ class WebRtcService {
 
   StreamController<Map<String, dynamic>>? _outgoingSignaling;
 
+  /// ICE 服务器配置；外网模式会由中继服务器下发（含 TURN）
+  List<Map<String, dynamic>> _iceServers = const [
+    {'urls': 'stun:stun.l.google.com:19302'},
+  ];
+
+  /// 在创建 PeerConnection 之前调用，切换 STUN/TURN 配置
+  void setIceServers(List<Map<String, dynamic>> servers) {
+    if (servers.isNotEmpty) _iceServers = servers;
+  }
+
   /// 设置信令输出（向对端发送 SDP/ICE 的回调通道）
   void setOutgoingSignaling(StreamController<Map<String, dynamic>> ctrl) {
     _outgoingSignaling = ctrl;
@@ -69,9 +79,7 @@ class WebRtcService {
 
   Future<void> _createPeerConnection() async {
     final config = <String, dynamic>{
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'},
-      ],
+      'iceServers': _iceServers,
     };
     _pc = await createPeerConnection(config);
 

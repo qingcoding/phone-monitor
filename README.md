@@ -26,7 +26,7 @@
 | 防息屏 + 后台保活引导 | ✅ |
 | 网页调试页：电脑浏览器直接看画面 | ✅ |
 | 多观看端并发 | ⬜ 计划中（当前单连接） |
-| 远程外网观看（TURN 中继） | ⬜ 计划中 |
+| 外网远程观看（自建 Go 中继 + TURN） | ✅ Demo |
 | AI 哭声识别 / 移动侦测告警 | ⬜ 计划中 |
 
 ---
@@ -116,6 +116,31 @@ http://<手机IP>:8765/
 
 ---
 
+## 外网访问（自建中继）
+
+不在同一 WiFi 时，用 [`server/`](server/) 里的 Go 服务做信令 + TURN 中继：
+
+```bash
+cd server
+go build -o phone-monitor-server .
+TURN_PUBLIC_IP=<服务器公网IP> ./phone-monitor-server   # 放通 8080/tcp 与 3478/udp+tcp
+```
+
+使用流程：
+
+1. 采集端点底部「外网访问 → 开启」，填入 `http://<服务器IP>:8080`
+2. 采集端会显示**房间号**，二维码同步变为远程二维码
+3. 观看端扫码即可（自动拉取 TURN 配置）；也可在「方式三」里手填服务器地址 + 房间号
+4. 双方无法 P2P 直连时，媒体自动走 TURN 中转
+
+说明：
+
+- 中继只是兜底，能直连时仍走 P2P，服务器不承载视频流量
+- Demo 使用固定 TURN 账号，公网长期运行请改用短期凭证 + wss，详见 [server/README.md](server/README.md)
+- 公网部署必须设置 `TURN_PUBLIC_IP`，否则 TURN 只在本机/同网段可用
+
+---
+
 ## 常见问题
 
 **5G WiFi 连不上，2.4G 可以？**
@@ -154,6 +179,7 @@ lib/
 │   ├── device_info.dart          本机 IP / 网络信息
 │   └── permissions.dart          权限申请
 assets/web/index.html             网页调试页（原生 WebRTC，无第三方依赖）
+server/                           外网中继（Go）：房间信令 + TURN
 ```
 
 ---
@@ -161,7 +187,7 @@ assets/web/index.html             网页调试页（原生 WebRTC，无第三方
 ## 路线图
 
 - [ ] 采集端支持多观看端并发（每客户端一个 PeerConnection）
-- [ ] 可选 TURN 中继，实现外网远程观看
+- [ ] 中继生产化：短期 TURN 凭证、房间令牌、wss、限流
 - [ ] 移动侦测 / 声音触发告警与推送
 - [ ] 录像分段、循环覆盖、云端存储
 - [ ] iOS 客户端（需 macOS 构建）

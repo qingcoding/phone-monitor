@@ -11,7 +11,11 @@ import '../../services/webrtc_service.dart';
 
 class ViewerPage extends StatefulWidget {
   final String url;
-  const ViewerPage({super.key, required this.url});
+
+  /// 外网模式由中继服务器下发的 ICE 配置（含 TURN），局域网模式为空
+  final List<Map<String, dynamic>>? iceServers;
+
+  const ViewerPage({super.key, required this.url, this.iceServers});
 
   @override
   State<ViewerPage> createState() => _ViewerPageState();
@@ -45,6 +49,9 @@ class _ViewerPageState extends State<ViewerPage> {
     try {
       _outgoing = StreamController<Map<String, dynamic>>.broadcast();
       _rtc.setOutgoingSignaling(_outgoing!);
+      if (widget.iceServers != null && widget.iceServers!.isNotEmpty) {
+        _rtc.setIceServers(widget.iceServers!);
+      }
       _outgoing!.stream.listen((msg) => _signaling.send(msg));
       _signaling.incoming.stream.listen((msg) => _rtc.handleMessage(msg));
 

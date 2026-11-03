@@ -50,3 +50,7 @@ android/app/*.jks
 android/app/*.keystore
 *.apk
 *.aab
+
+# Go 中继服务产物
+server/phone-monitor-server
+server/bin/

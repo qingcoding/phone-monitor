@@ -3,7 +3,7 @@ class AppConstants {
   AppConstants._();
 
   static const String appName = '旧手机监控';
-  static const String appVersion = '1.1.0';
+  static const String appVersion = '1.2.0';
 
   /// 采集端信令监听端口（同一局域网内观看端直连）
   static const int signalingPort = 8765;
