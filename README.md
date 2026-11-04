@@ -138,8 +138,10 @@ TURN_PUBLIC_IP=<服务器公网IP> ./phone-monitor-server   # 放通 8080/tcp �
 
 - 中继只是兜底，能直连时仍走 P2P，服务器不承载视频流量
 - TURN 凭证 10 分钟过期、房间令牌 6 小时过期，均由服务端密钥签名，客户端无法伪造；详见 [server/README.md](server/README.md)
+- 配置 `TLS_CERT` / `TLS_KEY` 即自动切换为 `https/wss` 与 `turns:`，APP 无需改动
+- 默认按 IP 限流：`/api/config` 10 次突发、WS 握手 5 秒/次、单 IP 最多 3 条连接，超限返回 429
 - 公网部署必须设置 `TURN_PUBLIC_IP`，否则 TURN 只在本机/同网段可用
-- 仍待完善：`wss://`、按 IP 限流、房间令牌发放需登录鉴权
+- 仍待完善：`/api/config` 发放令牌需登录鉴权（当前凭房间号即可换取）
 
 ---
 

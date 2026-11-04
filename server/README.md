@@ -30,9 +30,41 @@ TURN_PUBLIC_IP=1.2.3.4 ./phone-monitor-server
 | 端口 | 协议 | 用途 |
 |---|---|---|
 | 8080 | TCP | HTTP + WebSocket 信令 |
+| 8443 | TCP | HTTPS + WSS（启用 TLS 后） |
 | 3478 | UDP + TCP | TURN 中继 |
+| 5349 | TCP | TURN over TLS（启用 TLS 后） |
 
 云服务器安全组需同时放行 UDP 3478，只开 TCP 会导致部分网络下中继失败。
+
+## 启用 TLS（wss + turns）
+
+```bash
+# 用 Let's Encrypt 证书（推荐）
+sudo certbot certonly --standalone -d monitor.example.com
+TLS_CERT=/etc/letsencrypt/live/monitor.example.com/fullchain.pem \
+TLS_KEY=/etc/letsencrypt/live/monitor.example.com/privkey.pem \
+TURN_PUBLIC_IP=1.2.3.4 \
+./phone-monitor-server -addr :443
+```
+
+启用后 `/api/config` 自动改为下发：
+
+- `wss://<host>:<端口>/ws?...` 信令地址
+- `turns:<host>:5349?transport=tcp` 中继地址（同时保留 `turn:` 3478）
+
+APP 端无需改动：它按服务器下发的协议自动切换。注意自签证书在 APP 内会校验失败（这是预期行为），请使用受信任证书。
+
+## 限流
+
+所有限制按**客户端 IP** 计数，超限返回 `429` 并带 `Retry-After`：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `CFG_RATE` / `CFG_BURST` | `2` / `10` | `/api/config` 每秒令牌数 / 突发上限 |
+| `WS_RATE` / `WS_BURST` | `0.2` / `10` | WS 握手每秒令牌数 / 突发上限（约 5 秒 1 次持续） |
+| `WS_MAX_PER_IP` | `3` | 单 IP 最大并发 WS 连接数 |
+
+限流表每 2 分钟清理一次闲置 IP，避免内存增长。用反向代理时 `RemoteAddr` 是代理 IP，需按可信代理配置改写取真实 IP（当前未实现）。
 
 ## 配置项
 
@@ -40,6 +72,8 @@ TURN_PUBLIC_IP=1.2.3.4 ./phone-monitor-server
 |---|---|---|
 | `ADDR` | `:8080` | HTTP/WS 监听地址 |
 | `TURN_PORT` | `3478` | TURN 监听端口 |
+| `TURN_TLS_PORT` | `5349` | TURN over TLS 端口 |
+| `TLS_CERT` / `TLS_KEY` | 空 | 同时提供才启用 HTTPS/WSS/TURNS |
 | `TURN_SECRET` | 默认占位值 | TURN REST 凭证密钥，**生产必须改** |
 | `ROOM_SECRET` | 默认占位值 | 房间令牌签名密钥，**生产必须改** |
 | `TURN_TTL` | `600` | TURN 凭证有效期（秒） |
@@ -47,7 +81,7 @@ TURN_PUBLIC_IP=1.2.3.4 ./phone-monitor-server
 | `TURN_PUBLIC_IP` | 空 | TURN 对外 IP，跨 NAT 必须填公网 IP |
 | `TURN_REALM` | `phone-monitor` | TURN realm |
 
-也支持同名命令行参数，如 `-addr :8080`。
+也支持同名命令行参数，如 `-addr :8080`、`-ws-rate 0.5`。
 
 ## 鉴权机制
 
@@ -102,8 +136,10 @@ c.onmessage=e=>console.log('capture:',e.data);
 
 - [x] TURN REST 短期凭证（`TURN_SECRET` 签名，10 分钟过期）
 - [x] 房间令牌校验（`ROOM_SECRET` 签名，绑定 room + role）
-- [ ] WS 走 TLS（`wss://`），APP 端把 `ws://` 换成 `wss://`
-- [ ] 限制单 IP 并发与流量配额（`QuotaHandler`）
+- [x] WS 走 TLS（`wss://` 与 `turns:`，同一套证书）
+- [x] 按 IP 限流与并发上限（`CFG_RATE` / `WS_RATE` / `WS_MAX_PER_IP`）
+- [ ] 反向代理场景下取真实 IP（`X-Forwarded-For` 可信代理白名单）
+- [ ] TURN 侧配额（单 IP 分配数 / 流量上限）
 - [ ] 用 systemd / Docker 托管，开启日志轮转
 - [ ] 拆分 `/api/config` 为需登录的接口，避免房间令牌被任意人换取
 

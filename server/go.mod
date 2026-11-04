@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/pion/turn/v4 v4.1.4
+	golang.org/x/time v0.10.0
 )
 
 require (

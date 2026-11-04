@@ -19,6 +19,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/turn/v4"
+	"golang.org/x/time/rate"
 )
 
 type peer struct {
@@ -143,6 +145,14 @@ func main() {
 	roomSecret := flag.String("room-secret", envOr("ROOM_SECRET", "change-me-room-secret"), "房间令牌签名密钥")
 	turnTTL := flag.Int("turn-ttl", 600, "TURN 凭证有效期（秒）")
 	roomTTL := flag.Int("room-ttl", 21600, "房间令牌有效期（秒）")
+	tlsCert := flag.String("tls-cert", envOr("TLS_CERT", ""), "HTTPS/WSS 证书路径（.pem/.crt）")
+	tlsKey := flag.String("tls-key", envOr("TLS_KEY", ""), "HTTPS/WSS 私钥路径")
+	turnTLSPort := flag.String("turn-tls-port", envOr("TURN_TLS_PORT", "5349"), "TURN over TLS 端口（有证书时启用）")
+	cfgRate := flag.Float64("cfg-rate", envOrFloat("CFG_RATE", 2), "/api/config 每 IP 每秒令牌数")
+	cfgBurst := flag.Int("cfg-burst", envOrInt("CFG_BURST", 10), "/api/config 每 IP 突发上限")
+	wsRate := flag.Float64("ws-rate", envOrFloat("WS_RATE", 0.2), "WS 握手每 IP 每秒令牌数")
+	wsBurst := flag.Int("ws-burst", envOrInt("WS_BURST", 10), "WS 握手每 IP 突发上限")
+	wsMaxPerIP := flag.Int("ws-max-per-ip", envOrInt("WS_MAX_PER_IP", 3), "每 IP 最大并发连接数")
 	flag.Parse()
 
 	if *turnSecret == "change-me-turn-secret" || *roomSecret == "change-me-room-secret" {
@@ -150,6 +160,37 @@ func main() {
 	}
 	ts := []byte(*turnSecret)
 	rs := []byte(*roomSecret)
+
+	useTLS := *tlsCert != "" && *tlsKey != ""
+	if *tlsCert != "" != (*tlsKey != "") {
+		log.Fatalf("TLS_CERT 与 TLS_KEY 必须同时提供")
+	}
+	var tlsConfig *tls.Config
+	if useTLS {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Fatalf("加载 TLS 证书失败: %v", err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+	wsScheme := "ws"
+	if useTLS {
+		wsScheme = "wss"
+	}
+
+	// 限流器
+	cfgLimiter := newIPLimiter(rate.Limit(*cfgRate), *cfgBurst)
+	wsLimiter := newIPLimiter(rate.Limit(*wsRate), *wsBurst)
+	wsGuard := newIPConcurrency(*wsMaxPerIP)
+	go func() {
+		for range time.Tick(2 * time.Minute) {
+			cfgLimiter.prune(10 * time.Minute)
+			wsLimiter.prune(10 * time.Minute)
+		}
+	}()
 
 	h := newHub()
 
@@ -167,6 +208,21 @@ func main() {
 	if relayIP == nil {
 		log.Printf("警告：未设置 TURN_PUBLIC_IP，TURN 只能用于本机/同网段测试")
 		relayIP = net.ParseIP("127.0.0.1")
+	}
+
+	// TURN over TLS（有证书时启用，供限制 443/3478 的网络使用）
+	listeners := []turn.ListenerConfig{
+		{Listener: tcpListener, RelayAddressGenerator: staticRelay(relayIP)},
+	}
+	if tlsConfig != nil {
+		tlsListener, err := tls.Listen("tcp4", ":"+*turnTLSPort, tlsConfig)
+		if err != nil {
+			log.Fatalf("TURN TLS 监听失败: %v", err)
+		}
+		listeners = append(listeners, turn.ListenerConfig{
+			Listener: tlsListener, RelayAddressGenerator: staticRelay(relayIP),
+		})
+		log.Printf("TURN over TLS 监听 :%s", *turnTLSPort)
 	}
 
 	turnSrv, err := turn.NewServer(turn.ServerConfig{
@@ -187,9 +243,7 @@ func main() {
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{PacketConn: udpListener, RelayAddressGenerator: staticRelay(relayIP)},
 		},
-		ListenerConfigs: []turn.ListenerConfig{
-			{Listener: tcpListener, RelayAddressGenerator: staticRelay(relayIP)},
-		},
+		ListenerConfigs: listeners,
 	})
 	if err != nil {
 		log.Fatalf("TURN 启动失败: %v", err)
@@ -206,6 +260,11 @@ func main() {
 
 	// 下发短期 TURN 凭证与带令牌的 ws 地址
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		if !cfgLimiter.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", "3")
+			http.Error(w, "请求过于频繁", http.StatusTooManyRequests)
+			return
+		}
 		host := r.Host
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
@@ -213,7 +272,7 @@ func main() {
 		if *publicIP != "" {
 			host = *publicIP
 		}
-		wsBase := "ws://" + net.JoinHostPort(host, portOf(*addr)) + "/ws"
+		wsBase := wsScheme + "://" + net.JoinHostPort(host, portOf(*addr)) + "/ws"
 		turnURL := "turn:" + net.JoinHostPort(host, *turnPort)
 
 		room := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("room")))
@@ -236,11 +295,16 @@ func main() {
 		// TURN REST 凭证：username="过期时间戳:标签"，credential=base64(HMAC-SHA1(secret, username))
 		exp := time.Now().Add(time.Duration(*turnTTL) * time.Second).Unix()
 		turnUser := fmt.Sprintf("%d:phone-monitor", exp)
+		turnURLs := []string{
+			turnURL + "?transport=udp",
+			turnURL + "?transport=tcp",
+		}
+		if tlsConfig != nil {
+			turnURLs = append(turnURLs,
+				"turns:"+net.JoinHostPort(host, *turnTLSPort)+"?transport=tcp")
+		}
 		ice = append(ice, map[string]any{
-			"urls": []string{
-				turnURL + "?transport=udp",
-				turnURL + "?transport=tcp",
-			},
+			"urls":       turnURLs,
 			"username":   turnUser,
 			"credential": restCredential(ts, turnUser),
 		}, map[string]any{"urls": "stun:" + net.JoinHostPort(host, *turnPort)})
@@ -268,6 +332,19 @@ func main() {
 			http.Error(w, "房间令牌无效或已过期", http.StatusUnauthorized)
 			return
 		}
+		ip := clientIP(r)
+		if !wsLimiter.allow(ip) {
+			log.Printf("限流：%s 握手过于频繁", ip)
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "握手过于频繁", http.StatusTooManyRequests)
+			return
+		}
+		if !wsGuard.acquire(ip) {
+			log.Printf("限流：%s 并发连接数超限", ip)
+			http.Error(w, "并发连接数超限", http.StatusTooManyRequests)
+			return
+		}
+		defer wsGuard.release(ip)
 		c, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("upgrade error: %v", err)
@@ -304,9 +381,22 @@ func main() {
 		}
 	})
 
-	log.Printf("信令服务监听 %s", *addr)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         tlsConfig,
+	}
+	if useTLS {
+		log.Printf("信令服务监听 %s（HTTPS/WSS，%s）", *addr, *tlsCert)
+		if err := srv.ListenAndServeTLS(*tlsCert, *tlsKey); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Printf("信令服务监听 %s（HTTP/WS，未启用 TLS）", *addr)
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 
@@ -320,6 +410,24 @@ func staticRelay(ip net.IP) turn.RelayAddressGenerator {
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envOrInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envOrFloat(k string, def float64) float64 {
+	if v := os.Getenv(k); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
 	}
 	return def
 }
