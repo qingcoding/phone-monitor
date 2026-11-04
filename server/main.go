@@ -52,8 +52,8 @@ func (p *peer) send(v any) error {
 }
 
 type room struct {
-	mu     sync.Mutex
-	peers  map[string]*peer // role -> peer
+	mu    sync.Mutex
+	peers map[string]*peer // role -> peer
 }
 
 type hub struct {
@@ -83,6 +83,12 @@ func (h *hub) join(roomID, role string, c *websocket.Conn) (*room, *peer, *peer)
 		_ = other.send(map[string]any{"type": "peer", "event": "joined", "role": role})
 	}
 	return r, p, old
+}
+
+func (h *hub) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.rooms)
 }
 
 func (h *hub) leave(roomID string, p *peer) {
@@ -148,6 +154,9 @@ func main() {
 	tlsCert := flag.String("tls-cert", envOr("TLS_CERT", ""), "HTTPS/WSS 证书路径（.pem/.crt）")
 	tlsKey := flag.String("tls-key", envOr("TLS_KEY", ""), "HTTPS/WSS 私钥路径")
 	turnTLSPort := flag.String("turn-tls-port", envOr("TURN_TLS_PORT", "5349"), "TURN over TLS 端口（有证书时启用）")
+	relayMax := flag.Int("relay-max-sessions", envOrInt("RELAY_MAX_SESSIONS", 2), "TURN 中继最大并发会话数")
+	relayTotalKbps := flag.Float64("relay-total-kbps", envOrFloat("RELAY_TOTAL_KBPS", 3000), "TURN 中继总带宽上限（kbps）")
+	relaySessionKbps := flag.Float64("relay-session-kbps", envOrFloat("RELAY_SESSION_KBPS", 1200), "单个中继会话带宽上限（kbps）")
 	cfgRate := flag.Float64("cfg-rate", envOrFloat("CFG_RATE", 2), "/api/config 每 IP 每秒令牌数")
 	cfgBurst := flag.Int("cfg-burst", envOrInt("CFG_BURST", 10), "/api/config 每 IP 突发上限")
 	wsRate := flag.Float64("ws-rate", envOrFloat("WS_RATE", 0.2), "WS 握手每 IP 每秒令牌数")
@@ -210,9 +219,19 @@ func main() {
 		relayIP = net.ParseIP("127.0.0.1")
 	}
 
+	// 中继配额：并发会话 + 全局/单会话带宽（3Mbps 小水管必须限制）
+	relayGen := newQuotaGenerator(
+		staticRelay(relayIP),
+		*relayMax,
+		*relayTotalKbps,
+		*relaySessionKbps,
+	)
+	log.Printf("中继配额：最多 %d 路并发，总带宽 %.0f kbps，单路 %.0f kbps",
+		*relayMax, *relayTotalKbps, *relaySessionKbps)
+
 	// TURN over TLS（有证书时启用，供限制 443/3478 的网络使用）
 	listeners := []turn.ListenerConfig{
-		{Listener: tcpListener, RelayAddressGenerator: staticRelay(relayIP)},
+		{Listener: tcpListener, RelayAddressGenerator: relayGen},
 	}
 	if tlsConfig != nil {
 		tlsListener, err := tls.Listen("tcp4", ":"+*turnTLSPort, tlsConfig)
@@ -220,7 +239,7 @@ func main() {
 			log.Fatalf("TURN TLS 监听失败: %v", err)
 		}
 		listeners = append(listeners, turn.ListenerConfig{
-			Listener: tlsListener, RelayAddressGenerator: staticRelay(relayIP),
+			Listener: tlsListener, RelayAddressGenerator: relayGen,
 		})
 		log.Printf("TURN over TLS 监听 :%s", *turnTLSPort)
 	}
@@ -241,7 +260,7 @@ func main() {
 			return turn.GenerateAuthKey(username, realm, restCredential(ts, username)), true
 		},
 		PacketConnConfigs: []turn.PacketConnConfig{
-			{PacketConn: udpListener, RelayAddressGenerator: staticRelay(relayIP)},
+			{PacketConn: udpListener, RelayAddressGenerator: relayGen},
 		},
 		ListenerConfigs: listeners,
 	})
@@ -256,6 +275,15 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "time": time.Now().UTC()})
+	})
+
+	// 运行状态：中继占用与房间数，便于运维观察 3Mbps 是否打满
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"relay": relayGen.snapshot(),
+			"rooms": h.count(),
+		})
 	})
 
 	// 下发短期 TURN 凭证与带令牌的 ws 地址

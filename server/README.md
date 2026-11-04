@@ -66,6 +66,31 @@ APP 端无需改动：它按服务器下发的协议自动切换。注意自签�
 
 限流表每 2 分钟清理一次闲置 IP，避免内存增长。用反向代理时 `RemoteAddr` 是代理 IP，需按可信代理配置改写取真实 IP（当前未实现）。
 
+## 中继配额（3Mbps 小带宽必读）
+
+TURN 转发是**纯额外流量**：一路 720p 约 1.5~2 Mbps，3Mbps 服务器最多只能承载 1~2 路。配额在分配阶段硬性拒绝，避免第三路连上后把所有人拖慢。
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `RELAY_MAX_SESSIONS` | `2` | 全局最大并发中继会话，超限分配失败（客户端回落失败/无法连接） |
+| `RELAY_TOTAL_KBPS` | `3000` | 全局出向带宽上限（kbps），令牌桶整形 |
+| `RELAY_SESSION_KBPS` | `1200` | 单会话出向带宽上限（kbps） |
+
+默认值按「3Mbps 总带宽、单路 720p」给出，留约 0.6Mbps 余量给信令与重传。若只看 480p，可把 `RELAY_SESSION_KBPS` 调到 `800`，`RELAY_MAX_SESSIONS` 提到 `3`。
+
+实现方式：包装 `RelayAddressGenerator`，分配时占用信号量，关闭时释放；对转发 socket 的 `WriteTo`/`Write` 施加令牌桶（全局 + 单会话双重）。带宽限速作用于**服务器 → 客户端**方向。
+
+运维观察：
+
+```bash
+curl -s http://127.0.0.1:8080/stats
+# {"relay":{"active":1,"max":2,"rejected":3},"rooms":2}
+```
+
+`rejected` 持续增长说明配额或带宽不足，需要扩容或降低码率。
+
+> 2 核 4G 参考：单进程可稳定支撑 4~6 路转发；瓶颈通常先出现在带宽而非 CPU。若开 TLS，握手与加解密约占单核 10%~15%/路。
+
 ## 配置项
 
 | 环境变量 | 默认 | 说明 |
@@ -80,6 +105,9 @@ APP 端无需改动：它按服务器下发的协议自动切换。注意自签�
 | `ROOM_TTL` | `21600` | 房间令牌有效期（秒） |
 | `TURN_PUBLIC_IP` | 空 | TURN 对外 IP，跨 NAT 必须填公网 IP |
 | `TURN_REALM` | `phone-monitor` | TURN realm |
+| `RELAY_MAX_SESSIONS` | `2` | 最大并发中继会话 |
+| `RELAY_TOTAL_KBPS` | `3000` | 中继总带宽上限（kbps） |
+| `RELAY_SESSION_KBPS` | `1200` | 单会话带宽上限（kbps） |
 
 也支持同名命令行参数，如 `-addr :8080`、`-ws-rate 0.5`。
 
@@ -106,6 +134,7 @@ token = "<过期时间戳>.<hex(HMAC-SHA256(ROOM_SECRET, room:role:exp))>"
 
 ```http
 GET /healthz                                # {"ok":true,...}
+GET /stats                                  # 中继占用/拒绝数、房间数
 GET /api/config                             # ws 地址 + STUN（无房间时）
 GET /api/config?room=ABC123&role=capture    # 带令牌的 ws + 短期 TURN 凭证
 GET /ws?room=ABC123&role=capture&token=...  # 采集端
@@ -138,8 +167,9 @@ c.onmessage=e=>console.log('capture:',e.data);
 - [x] 房间令牌校验（`ROOM_SECRET` 签名，绑定 room + role）
 - [x] WS 走 TLS（`wss://` 与 `turns:`，同一套证书）
 - [x] 按 IP 限流与并发上限（`CFG_RATE` / `WS_RATE` / `WS_MAX_PER_IP`）
+- [x] TURN 配额：并发会话 + 全局/单会话带宽整形（`RELAY_*`）
 - [ ] 反向代理场景下取真实 IP（`X-Forwarded-For` 可信代理白名单）
-- [ ] TURN 侧配额（单 IP 分配数 / 流量上限）
+- [ ] 按 IP 的中继会话配额（当前为全局上限）
 - [ ] 用 systemd / Docker 托管，开启日志轮转
 - [ ] 拆分 `/api/config` 为需登录的接口，避免房间令牌被任意人换取
 
