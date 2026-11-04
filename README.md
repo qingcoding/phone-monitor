@@ -123,6 +123,7 @@ http://<手机IP>:8765/
 ```bash
 cd server
 go build -o phone-monitor-server .
+export TURN_SECRET=$(openssl rand -hex 32) ROOM_SECRET=$(openssl rand -hex 32)
 TURN_PUBLIC_IP=<服务器公网IP> ./phone-monitor-server   # 放通 8080/tcp 与 3478/udp+tcp
 ```
 
@@ -130,14 +131,15 @@ TURN_PUBLIC_IP=<服务器公网IP> ./phone-monitor-server   # 放通 8080/tcp �
 
 1. 采集端点底部「外网访问 → 开启」，填入 `http://<服务器IP>:8080`
 2. 采集端会显示**房间号**，二维码同步变为远程二维码
-3. 观看端扫码即可（自动拉取 TURN 配置）；也可在「方式三」里手填服务器地址 + 房间号
+3. 观看端扫码即可（自动换取观看端专属令牌）；也可在「方式三」里手填服务器地址 + 房间号
 4. 双方无法 P2P 直连时，媒体自动走 TURN 中转
 
 说明：
 
 - 中继只是兜底，能直连时仍走 P2P，服务器不承载视频流量
-- Demo 使用固定 TURN 账号，公网长期运行请改用短期凭证 + wss，详见 [server/README.md](server/README.md)
+- TURN 凭证 10 分钟过期、房间令牌 6 小时过期，均由服务端密钥签名，客户端无法伪造；详见 [server/README.md](server/README.md)
 - 公网部署必须设置 `TURN_PUBLIC_IP`，否则 TURN 只在本机/同网段可用
+- 仍待完善：`wss://`、按 IP 限流、房间令牌发放需登录鉴权
 
 ---
 
@@ -187,7 +189,7 @@ server/                           外网中继（Go）：房间信令 + TURN
 ## 路线图
 
 - [ ] 采集端支持多观看端并发（每客户端一个 PeerConnection）
-- [ ] 中继生产化：短期 TURN 凭证、房间令牌、wss、限流
+- [ ] 中继生产化：wss、按 IP 限流、房间令牌发放加登录鉴权
 - [ ] 移动侦测 / 声音触发告警与推送
 - [ ] 录像分段、循环覆盖、云端存储
 - [ ] iOS 客户端（需 macOS 构建）

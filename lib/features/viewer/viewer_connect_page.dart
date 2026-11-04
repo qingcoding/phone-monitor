@@ -32,15 +32,37 @@ class _ViewerConnectPageState extends State<ViewerConnectPage> {
   Future<void> _connect(String payload) async {
     String? url;
     String? relayBase;
+    String? room;
     try {
       final map = jsonDecode(payload) as Map<String, dynamic>;
       url = map['url'] as String?;
       relayBase = map['relay'] as String?;
+      room = map['room'] as String?;
     } catch (_) {
       if (payload.startsWith('ws://') || payload.startsWith('wss://')) {
         url = payload;
       }
     }
+
+    List<Map<String, dynamic>>? ice;
+    // 远程二维码：用中继地址 + 房间号换取观看端专属短期凭证
+    if (relayBase != null && relayBase.isNotEmpty && room != null) {
+      setState(() => _busy = true);
+      try {
+        final cfg = await RelayConfig.fetch(relayBase, room: room, role: 'viewer');
+        url = cfg.wsUrl;
+        ice = cfg.iceServers;
+      } catch (e) {
+        if (mounted) {
+          setState(() => _busy = false);
+          _toast('无法获取中继配置：$e');
+        }
+        return;
+      }
+      if (!mounted) return;
+      setState(() => _busy = false);
+    }
+
     if (url == null || url.isEmpty) {
       _toast('无效的采集端地址');
       return;
@@ -51,23 +73,6 @@ class _ViewerConnectPageState extends State<ViewerConnectPage> {
         !state.boundDevices.contains(connectUrl)) {
       _toast('已达绑定上限（${state.maxDevices} 台），升级会员可绑定 5 台');
       return;
-    }
-
-    // 远程二维码：需要先从中继服务器取回 TURN 配置
-    List<Map<String, dynamic>>? ice;
-    if (relayBase != null && relayBase.isNotEmpty) {
-      setState(() => _busy = true);
-      try {
-        ice = (await RelayConfig.fetch(relayBase)).iceServers;
-      } catch (e) {
-        if (mounted) {
-          setState(() => _busy = false);
-          _toast('无法获取中继配置：$e');
-        }
-        return;
-      }
-      if (!mounted) return;
-      setState(() => _busy = false);
     }
 
     if (!mounted) return;
@@ -87,12 +92,12 @@ class _ViewerConnectPageState extends State<ViewerConnectPage> {
     }
     setState(() => _busy = true);
     try {
-      final cfg = await RelayConfig.fetch(server);
+      final cfg = await RelayConfig.fetch(server, room: room, role: 'viewer');
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
           builder: (_) => ViewerPage(
-            url: cfg.roomUrl(room, 'viewer'),
+            url: cfg.wsUrl,
             iceServers: cfg.iceServers,
           ),
         ),

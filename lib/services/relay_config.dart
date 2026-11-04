@@ -28,12 +28,23 @@ class RelayConfig {
     return s;
   }
 
-  static Future<RelayConfig> fetch(String base) async {
+  static Future<RelayConfig> fetch(
+    String base, {
+    String? room,
+    String? role,
+  }) async {
     final normalized = normalizeBase(base);
+    var uri = Uri.parse('$normalized/api/config');
+    if (room != null || role != null) {
+      uri = uri.replace(queryParameters: {
+        if (room != null) 'room': room,
+        if (role != null) 'role': role,
+      });
+    }
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 8);
     try {
-      final req = await client.getUrl(Uri.parse('$normalized/api/config'));
+      final req = await client.getUrl(uri);
       final res = await req.close().timeout(const Duration(seconds: 12));
       if (res.statusCode != 200) {
         throw Exception('中继服务器返回 HTTP ${res.statusCode}');
@@ -51,11 +62,5 @@ class RelayConfig {
     } finally {
       client.close(force: true);
     }
-  }
-
-  /// 拼接房间地址，role 为 capture/viewer
-  String roomUrl(String room, String role) {
-    final sep = wsUrl.contains('?') ? '&' : '?';
-    return '$wsUrl${sep}room=$room&role=$role';
   }
 }

@@ -86,9 +86,8 @@ class _CapturePageState extends State<CapturePage> {
 
   String get _qrData {
     if (_remoteOn && _relay != null && _roomCode != null) {
-      // 远程模式：二维码里带上中继地址与房间号，观看端扫码后自动拉取 TURN 配置
+      // 远程模式：二维码只暴露中继地址与房间号，观看端扫码后再换取自己的短期凭证
       return jsonEncode({
-        'url': _relay!.roomUrl(_roomCode!, 'viewer'),
         'relay': _relay!.baseUrl,
         'room': _roomCode,
         'name': '家中摄像头',
@@ -122,7 +121,8 @@ class _CapturePageState extends State<CapturePage> {
     setState(() => _remoteBusy = true);
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final cfg = await RelayConfig.fetch(serverAddr);
+      final room = _roomCode ?? _genRoom();
+      final cfg = await RelayConfig.fetch(serverAddr, room: room, role: 'capture');
 
       // 重建 PeerConnection，使 TURN 配置生效
       await _rtc.hangUp();
@@ -132,11 +132,11 @@ class _CapturePageState extends State<CapturePage> {
       await _remoteClient?.disconnect();
       final client = SignalingClient();
       client.incoming.stream.listen((msg) => _rtc.handleMessage(msg));
-      _roomCode = _roomCode ?? _genRoom();
-      await client.connect(cfg.roomUrl(_roomCode!, 'capture'));
+      await client.connect(cfg.wsUrl);
 
       _remoteClient = client;
       _relay = cfg;
+      _roomCode = room;
       setState(() {
         _remoteOn = true;
         _remoteBusy = false;

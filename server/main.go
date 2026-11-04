@@ -6,22 +6,29 @@
 //
 // 用法：
 //
-//	TURN_PUBLIC_IP=1.2.3.4 TURN_USER=demo TURN_PASS=demo123 go run .
+//	TURN_PUBLIC_IP=1.2.3.4 TURN_SECRET=<随机串> ROOM_SECRET=<随机串> go run .
 //
 // 对外接口：
 //
 //	GET /healthz     健康检查
-//	GET /api/config  下发 ws 地址与 ICE 服务器（含 TURN 账号）
-//	GET /ws          信令：?room=ABC123&role=capture|viewer
+//	GET /api/config?room=ABC123&role=capture  下发带令牌的 ws 地址与短期 TURN 凭证
+//	GET /ws?room=ABC123&role=capture&token=... 信令房间
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,11 +137,19 @@ var upgrader = websocket.Upgrader{
 func main() {
 	addr := flag.String("addr", envOr("ADDR", ":8080"), "监听地址")
 	turnPort := flag.String("turn-port", envOr("TURN_PORT", "3478"), "TURN 监听端口(UDP/TCP)")
-	turnUser := flag.String("turn-user", envOr("TURN_USER", "demo"), "TURN 用户名")
-	turnPass := flag.String("turn-pass", envOr("TURN_PASS", "demo123"), "TURN 密码")
 	publicIP := flag.String("turn-public-ip", envOr("TURN_PUBLIC_IP", ""), "TURN 对外 IP（跨 NAT 时必须填公网 IP）")
 	realm := flag.String("realm", envOr("TURN_REALM", "phone-monitor"), "TURN realm")
+	turnSecret := flag.String("turn-secret", envOr("TURN_SECRET", "change-me-turn-secret"), "TURN REST 短期凭证的共享密钥")
+	roomSecret := flag.String("room-secret", envOr("ROOM_SECRET", "change-me-room-secret"), "房间令牌签名密钥")
+	turnTTL := flag.Int("turn-ttl", 600, "TURN 凭证有效期（秒）")
+	roomTTL := flag.Int("room-ttl", 21600, "房间令牌有效期（秒）")
 	flag.Parse()
+
+	if *turnSecret == "change-me-turn-secret" || *roomSecret == "change-me-room-secret" {
+		log.Printf("警告：正在使用默认密钥，公网部署前请设置 TURN_SECRET / ROOM_SECRET")
+	}
+	ts := []byte(*turnSecret)
+	rs := []byte(*roomSecret)
 
 	h := newHub()
 
@@ -156,11 +171,18 @@ func main() {
 
 	turnSrv, err := turn.NewServer(turn.ServerConfig{
 		Realm: *realm,
+		// TURN REST 短期凭证：username = "<过期时间戳>:<标签>"，密码由共享密钥 HMAC-SHA1 派生
 		AuthHandler: func(username, realm string, _ net.Addr) ([]byte, bool) {
-			if username != *turnUser {
+			expStr, _, ok := strings.Cut(username, ":")
+			if !ok {
 				return nil, false
 			}
-			return turn.GenerateAuthKey(username, realm, *turnPass), true
+			exp, err := strconv.ParseInt(expStr, 10, 64)
+			if err != nil || time.Now().Unix() > exp {
+				log.Printf("TURN 拒绝过期/非法凭证: %q", username)
+				return nil, false
+			}
+			return turn.GenerateAuthKey(username, realm, restCredential(ts, username)), true
 		},
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{PacketConn: udpListener, RelayAddressGenerator: staticRelay(relayIP)},
@@ -173,7 +195,7 @@ func main() {
 		log.Fatalf("TURN 启动失败: %v", err)
 	}
 	defer turnSrv.Close()
-	log.Printf("TURN 已启动: %s:%s (user=%s, realm=%s, relayIP=%s)", "0.0.0.0", *turnPort, *turnUser, *realm, relayIP)
+	log.Printf("TURN 已启动: :%s (realm=%s, relayIP=%s, 凭证有效期=%ds)", *turnPort, *realm, relayIP, *turnTTL)
 
 	mux := http.NewServeMux()
 
@@ -182,7 +204,7 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "time": time.Now().UTC()})
 	})
 
-	// 下发 ICE 配置，避免把 TURN 账号硬编码进 APP
+	// 下发短期 TURN 凭证与带令牌的 ws 地址
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if h, _, err := net.SplitHostPort(host); err == nil {
@@ -191,30 +213,59 @@ func main() {
 		if *publicIP != "" {
 			host = *publicIP
 		}
+		wsBase := "ws://" + net.JoinHostPort(host, portOf(*addr)) + "/ws"
 		turnURL := "turn:" + net.JoinHostPort(host, *turnPort)
+
+		room := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("room")))
+		role := r.URL.Query().Get("role")
+
+		ice := []map[string]any{}
+		var wsURL string
+
+		if room != "" || role != "" {
+			if !validRoom(room) || (role != "capture" && role != "viewer") {
+				http.Error(w, "room 与 role 参数不合法", http.StatusBadRequest)
+				return
+			}
+			token := signRoom(rs, room, role, time.Now().Add(time.Duration(*roomTTL)*time.Second).Unix())
+			wsURL = fmt.Sprintf("%s?room=%s&role=%s&token=%s", wsBase, room, role, token)
+		} else {
+			wsURL = wsBase
+		}
+
+		// TURN REST 凭证：username="过期时间戳:标签"，credential=base64(HMAC-SHA1(secret, username))
+		exp := time.Now().Add(time.Duration(*turnTTL) * time.Second).Unix()
+		turnUser := fmt.Sprintf("%d:phone-monitor", exp)
+		ice = append(ice, map[string]any{
+			"urls": []string{
+				turnURL + "?transport=udp",
+				turnURL + "?transport=tcp",
+			},
+			"username":   turnUser,
+			"credential": restCredential(ts, turnUser),
+		}, map[string]any{"urls": "stun:" + net.JoinHostPort(host, *turnPort)})
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		log.Printf("/api/config room=%q role=%q → 已签发 TURN 凭证(exp=%d)", room, role, exp)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ws": "ws://" + net.JoinHostPort(host, portOf(*addr)) + "/ws",
-			"iceServers": []map[string]any{
-				{
-					"urls": []string{
-						turnURL + "?transport=udp",
-						turnURL + "?transport=tcp",
-					},
-					"username":   *turnUser,
-					"credential": *turnPass,
-				},
-				{"urls": "stun:" + net.JoinHostPort(host, *turnPort)},
-			},
+			"ws":         wsURL,
+			"iceServers": ice,
+			"turnExpiry": exp,
 		})
 	})
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		roomID := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("room")))
 		role := r.URL.Query().Get("role")
-		if roomID == "" || len(roomID) > 16 || (role != "capture" && role != "viewer") {
+		token := r.URL.Query().Get("token")
+		if !validRoom(roomID) || (role != "capture" && role != "viewer") {
 			http.Error(w, "room 与 role 参数不合法", http.StatusBadRequest)
+			return
+		}
+		if !verifyRoom(rs, roomID, role, token) {
+			log.Printf("拒绝无效房间令牌 room=%s role=%s", roomID, role)
+			http.Error(w, "房间令牌无效或已过期", http.StatusUnauthorized)
 			return
 		}
 		c, err := upgrader.Upgrade(w, r, nil)
@@ -278,4 +329,48 @@ func portOf(addr string) string {
 		return p
 	}
 	return "8080"
+}
+
+// TURN REST 凭证：password = base64(HMAC-SHA1(secret, username))
+func restCredential(secret []byte, username string) string {
+	mac := hmac.New(sha1.New, secret)
+	mac.Write([]byte(username))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func validRoom(room string) bool {
+	if len(room) < 4 || len(room) > 16 {
+		return false
+	}
+	for _, c := range room {
+		if (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// 房间令牌：<过期时间戳>.<hex(HMAC-SHA256(secret, room:role:exp))>
+func signRoom(secret []byte, room, role string, exp int64) string {
+	mac := hmac.New(sha256.New, secret)
+	fmt.Fprintf(mac, "%s:%s:%d", room, role, exp)
+	return strconv.FormatInt(exp, 10) + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+func verifyRoom(secret []byte, room, role, token string) bool {
+	expStr, sig, ok := strings.Cut(token, ".")
+	if !ok {
+		return false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return false
+	}
+	want := hmac.New(sha256.New, secret)
+	fmt.Fprintf(want, "%s:%s:%d", room, role, exp)
+	got, err := hex.DecodeString(sig)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(want.Sum(nil), got)
 }
