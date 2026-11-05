@@ -17,6 +17,7 @@ import '../../services/relay_config.dart';
 import '../../services/signaling_client.dart';
 import '../../services/signaling_server.dart';
 import '../../services/webrtc_service.dart';
+import '../settings/membership_page.dart';
 
 class CapturePage extends StatefulWidget {
   const CapturePage({super.key});
@@ -45,6 +46,14 @@ class _CapturePageState extends State<CapturePage> {
   String? _roomCode;
   bool _remoteOn = false;
   bool _remoteBusy = false;
+  /// 远程模式视频高度：480 免费，720/1080 需会员
+  int _remoteHeight = 480;
+
+  static const List<(int, String, bool)> _qualityOptions = [
+    (480, '480p', false),
+    (720, '720p', true),
+    (1080, '1080p', true),
+  ];
 
   @override
   void initState() {
@@ -117,17 +126,23 @@ class _CapturePageState extends State<CapturePage> {
   }
 
   /// 开启外网访问：拉取中继配置 → 用 TURN 重建 PeerConnection → 进入房间
-  Future<void> _enableRemote(String serverAddr) async {
+  /// [height] 远程画质：480 免费，720/1080 需会员
+  Future<void> _enableRemote(String serverAddr, int height) async {
+    // 双保险：非会员即使传入高画质也回落到 480p
+    if (height > 480 && !context.read<AppState>().isVip) {
+      height = 480;
+      _promptUpgrade();
+    }
     setState(() => _remoteBusy = true);
     final messenger = ScaffoldMessenger.of(context);
     try {
       final room = _roomCode ?? _genRoom();
       final cfg = await RelayConfig.fetch(serverAddr, room: room, role: 'capture');
 
-      // 重建 PeerConnection，使 TURN 配置生效
+      // 重建 PeerConnection，使 TURN 配置与画质生效
       await _rtc.hangUp();
       _rtc.setIceServers(cfg.iceServers);
-      await _rtc.startCapture(audio: true, video: true);
+      await _rtc.startCapture(audio: true, video: true, height: height);
 
       await _remoteClient?.disconnect();
       final client = SignalingClient();
@@ -140,9 +155,10 @@ class _CapturePageState extends State<CapturePage> {
       setState(() {
         _remoteOn = true;
         _remoteBusy = false;
+        _remoteHeight = height;
       });
       messenger.showSnackBar(
-        SnackBar(content: Text('外网访问已开启，房间号 $_roomCode')),
+        SnackBar(content: Text('外网访问已开启（${height}p），房间号 $_roomCode')),
       );
     } catch (e) {
       setState(() => _remoteBusy = false);
@@ -167,54 +183,103 @@ class _CapturePageState extends State<CapturePage> {
 
   Future<void> _showRemoteDialog() async {
     final ctrl = TextEditingController(text: _relay?.baseUrl ?? '');
-    final address = await showDialog<String>(
+    final vip = context.read<AppState>().isVip;
+    var selected = _remoteHeight;
+    final result = await showDialog<(String, int)?>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('外网访问（中继）'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              '填自建中继服务器地址，例如 http://1.2.3.4:8080 。\n'
-              '开启后，观看端可在任意网络下扫码连接。',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => AlertDialog(
+          title: const Text('外网访问（中继）'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '填自建中继服务器地址，例如 http://1.2.3.4:8080 。\n'
+                  '开启后，观看端可在任意网络下扫码连接。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: ctrl,
+                  decoration: const InputDecoration(
+                    labelText: '中继服务器',
+                    hintText: 'http://1.2.3.4:8080',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text('远程画质', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    for (final q in _qualityOptions)
+                      ChoiceChip(
+                        label: Text(q.$3 ? '${q.$2} 🔒' : q.$2),
+                        selected: selected == q.$1,
+                        onSelected: (_) {
+                          if (q.$3 && !vip) {
+                            _promptUpgrade();
+                            return;
+                          }
+                          setDlg(() => selected = q.$1);
+                        },
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  vip
+                      ? '会员已开通，可选 720p / 1080p'
+                      : '非会员仅支持 480p（约 0.8 Mbps，适配 3 Mbps 中继）',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: ctrl,
-              decoration: const InputDecoration(
-                labelText: '中继服务器',
-                hintText: 'http://1.2.3.4:8080',
-                border: OutlineInputBorder(),
+          ),
+          actions: [
+            if (_remoteOn)
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(('__off__', 0)),
+                child: const Text('关闭外网', style: TextStyle(color: Colors.red)),
               ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop((ctrl.text.trim(), selected)),
+              child: Text(_remoteOn ? '重新连接' : '开启'),
             ),
           ],
         ),
-        actions: [
-          if (_remoteOn)
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop('__off__'),
-              child: const Text('关闭外网', style: TextStyle(color: Colors.red)),
-            ),
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(ctrl.text.trim()),
-            child: Text(_remoteOn ? '重新连接' : '开启'),
-          ),
-        ],
       ),
     );
+    if (result == null) return;
+    final (address, height) = result;
     if (address == '__off__') {
       await _disableRemote();
       return;
     }
-    if (address != null && address.isNotEmpty) {
-      await _enableRemote(address);
+    if (address.isNotEmpty) {
+      await _enableRemote(address, height);
     }
+  }
+
+  void _promptUpgrade() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text('720p / 1080p 为会员功能'),
+        action: SnackBarAction(
+          label: '去开通',
+          onPressed: () => Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => const MembershipPage()),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _toggleRecording() async {
@@ -353,7 +418,7 @@ class _CapturePageState extends State<CapturePage> {
                                 const SizedBox(height: 6),
                                 Text(
                                   _remoteOn
-                                      ? '外网房间：$_roomCode'
+                                      ? '外网房间：$_roomCode · ${_remoteHeight}p'
                                       : 'APP 地址：$_wsUrl',
                                   style: TextStyle(
                                     color: _remoteOn ? Colors.deepOrange : Colors.grey,
@@ -448,7 +513,7 @@ class _CapturePageState extends State<CapturePage> {
 
   String get _remoteMoodLabel {
     if (_remoteBusy) return '连接中';
-    if (_remoteOn) return '外网已开';
+    if (_remoteOn) return '外网${_remoteHeight}p';
     return '外网访问';
   }
 

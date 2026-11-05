@@ -37,17 +37,22 @@ class WebRtcService {
   }
 
   /// 采集端：采集本地音视频，等待观看端发起 offer
+  /// [height] 视频高度：480 / 720 / 1080，决定编码分辨率与帧率
   Future<void> startCapture({
     bool audio = true,
     bool video = true,
+    int height = 720,
   }) async {
+    final width = (height * 16 / 9).round();
+    final fps = height <= 480 ? 20 : (height <= 720 ? 24 : 30);
     final constraints = <String, dynamic>{
       'audio': audio,
       'video': video
           ? {
               'facingMode': 'environment',
-              'width': {'ideal': 1280},
-              'height': {'ideal': 720},
+              'width': {'ideal': width},
+              'height': {'ideal': height},
+              'frameRate': {'ideal': fps},
             }
           : false,
     };

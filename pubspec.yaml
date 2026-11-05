@@ -1,7 +1,7 @@
 name: phone_monitor
 description: "旧手机监控 - 闲置手机改造家用监控工具（婴儿看护/宠物看护/居家安防）"
 publish_to: 'none'
-version: 1.2.0+3
+version: 1.2.1+4
 
 environment:
   sdk: ^3.6.0

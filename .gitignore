@@ -54,3 +54,7 @@ android/app/*.keystore
 # Go 中继服务产物
 server/phone-monitor-server
 server/bin/
+
+# 本地构建工具链缓存（不提交）
+.toolchain/
+.gradle-cache/
